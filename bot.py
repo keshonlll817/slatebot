@@ -2,11 +2,13 @@ import discord
 from discord.ext import commands
 import asyncio
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import os
 
 # ================== CONFIG ==================
-TOKEN = os.getenv("TOKEN")  # or replace with your token string
+TOKEN = os.getenv("TOKEN")  # or replace with string
 ROLE_NAME = "TT Official"
+EST = ZoneInfo("America/New_York")
 
 # ================== BOT SETUP ==================
 intents = discord.Intents.default()
@@ -25,13 +27,17 @@ def make_key(league, p1, p2, time_str):
     return f"{league}|{p1}|{p2}|{time_str}"
 
 def parse_time(time_str):
-    now = datetime.now()
+    now = datetime.now(EST)
+
     dt = datetime.strptime(
         f"{now.strftime('%Y-%m-%d')} {time_str}",
         "%Y-%m-%d %I:%M %p"
-    )
-    if dt < now:
+    ).replace(tzinfo=EST)
+
+    # Prevent false "next day"
+    if dt < now - timedelta(minutes=2):
         dt += timedelta(days=1)
+
     return dt
 
 def find_role(guild):
@@ -72,7 +78,7 @@ def extract_plays(text):
 
     return plays
 
-# ================== REMINDER LOGIC ==================
+# ================== REMINDERS ==================
 
 def schedule_play(play, channel, guild_id):
     key = make_key(play["league"], play["p1"], play["p2"], play["time"])
@@ -84,7 +90,7 @@ def schedule_play(play, channel, guild_id):
         return
 
     dt = parse_time(play["time"])
-    delay = (dt - datetime.now()).total_seconds()
+    delay = (dt - datetime.now(EST)).total_seconds()
 
     async def reminder():
         await asyncio.sleep(delay)
@@ -116,7 +122,6 @@ async def on_message(message):
     content = message.content
     guild_id = message.guild.id
 
-    # ===== DETECT SLATE =====
     if "vs" in content and "@" in content:
         plays = extract_plays(content)
 
@@ -128,13 +133,12 @@ async def on_message(message):
         await message.channel.send(f"⏰ REMINDERS SET ({len(plays)} plays)")
         return
 
-    # ===== REMINDERS COMMAND =====
     if content == "!reminders":
         if guild_id not in scheduled_tasks or not scheduled_tasks[guild_id]:
             await message.channel.send("⏰ No reminders currently scheduled.")
             return
 
-        now = datetime.now()
+        now = datetime.now(EST)
 
         lines = [f"⏰ ACTIVE REMINDERS ({len(scheduled_tasks[guild_id])})"]
 
@@ -158,9 +162,28 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
+# ✅ EDIT HANDLER (NEW FIX)
+@bot.event
+async def on_message_edit(before, after):
+    if after.author.bot:
+        return
+
+    content = after.content
+    guild_id = after.guild.id
+
+    if "vs" in content and "@" in content:
+        plays = extract_plays(content)
+
+        clear_guild_tasks(guild_id)
+
+        for play in plays:
+            schedule_play(play, after.channel, guild_id)
+
+        await after.channel.send(f"🔄 REMINDERS UPDATED ({len(plays)} plays)")
+
 # ================== RUN ==================
 
 if not TOKEN:
-    print("❌ TOKEN is missing. Set it in environment variables.")
+    print("❌ TOKEN missing")
 else:
     bot.run(TOKEN)
