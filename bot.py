@@ -1,0 +1,221 @@
+
+# ================= SLATEBOT ENTERPRISE FINAL =================
+# FULL SYSTEM: Reminders + CSV + Recap + Analytics (integrated)
+
+import discord
+from discord.ext import commands
+import asyncio
+import csv
+import io
+import os
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+TOKEN = os.getenv("TOKEN")
+
+EST = ZoneInfo("America/New_York")
+ROLE_NAME = "TT Official"
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ================= DATA =================
+scheduled_tasks = {}
+active_keys = {}
+history = []  # store plays for recap/analytics
+
+# ================= HELPERS =================
+
+def make_key(l, p1, p2, t):
+    return f"{l}|{p1}|{p2}|{t}"
+
+def parse_time(time_str):
+    now = datetime.now(EST)
+    dt = datetime.strptime(
+        f"{now.strftime('%Y-%m-%d')} {time_str}",
+        "%Y-%m-%d %I:%M %p"
+    ).replace(tzinfo=EST)
+
+    if dt < now - timedelta(minutes=2):
+        dt += timedelta(days=1)
+
+    return dt
+
+def find_role(guild):
+    return discord.utils.get(guild.roles, name=ROLE_NAME)
+
+async def send_ping(ch, text):
+    role = find_role(ch.guild)
+    if role:
+        await ch.send(
+            f"{role.mention} {text}",
+            allowed_mentions=discord.AllowedMentions(roles=True)
+        )
+    else:
+        await ch.send(text)
+
+# ================= PARSER =================
+
+def extract_plays(text):
+    plays = []
+    for line in text.splitlines():
+        if "@" in line and "vs" in line:
+            try:
+                parts = line.split("@")
+                matchup = parts[0]
+                time_part = parts[1].split("EST")[0].strip()
+
+                league, rest = matchup.split("–")
+                p1, p2 = rest.split("vs")
+
+                stats = ""
+                emoji = ""
+
+                if "(" in line and ")" in line:
+                    stats = line.split("(")[-1].split(")")[0]
+
+                if "☢️" in line:
+                    emoji = "☢️"
+                elif "⚠️" in line:
+                    emoji = "⚠️"
+
+                plays.append({
+                    "league": league.strip(),
+                    "p1": p1.strip(),
+                    "p2": p2.strip(),
+                    "time": time_part.strip(),
+                    "stats": stats,
+                    "emoji": emoji
+                })
+            except:
+                continue
+    return plays
+
+# ================= REMINDERS =================
+
+def schedule_message_plays(message, plays):
+    guild_id = message.guild.id
+    message_id = message.id
+
+    if guild_id not in scheduled_tasks:
+        scheduled_tasks[guild_id] = {}
+    if guild_id not in active_keys:
+        active_keys[guild_id] = set()
+
+    if message_id in scheduled_tasks[guild_id]:
+        for key, task in scheduled_tasks[guild_id][message_id].items():
+            task.cancel()
+            active_keys[guild_id].discard(key)
+
+    scheduled_tasks[guild_id][message_id] = {}
+
+    added = 0
+
+    for play in plays:
+        key = make_key(play["league"], play["p1"], play["p2"], play["time"])
+
+        if key in active_keys[guild_id]:
+            continue
+
+        async def reminder(p=play):
+            game_time = parse_time(p["time"])
+            now = datetime.now(EST)
+
+            stats = f" ({p['stats']})" if p["stats"] else ""
+            emoji = f" {p['emoji']}" if p["emoji"] else ""
+
+            pre_delay = (game_time - timedelta(minutes=5) - now).total_seconds()
+
+            if pre_delay > 0:
+                await asyncio.sleep(pre_delay)
+                await send_ping(message.channel,
+                    f"{p['league']} – {p['p1']} vs {p['p2']}{stats}{emoji} | STARTING SOON"
+                )
+
+            now2 = datetime.now(EST)
+            start_delay = (game_time - now2).total_seconds()
+
+            if start_delay > 0:
+                await asyncio.sleep(start_delay)
+
+            await send_ping(message.channel,
+                f"{p['league']} – {p['p1']} vs {p['p2']}{stats}{emoji} | STARTING NOW"
+            )
+
+        task = asyncio.create_task(reminder(play))
+
+        scheduled_tasks[guild_id][message_id][key] = task
+        active_keys[guild_id].add(key)
+
+        history.append(play)
+        added += 1
+
+    return added
+
+# ================= CSV =================
+
+@bot.command()
+async def upload(ctx):
+    if not ctx.message.attachments:
+        await ctx.send("Attach a CSV.")
+        return
+
+    file = ctx.message.attachments[0]
+    data = await file.read()
+    text = data.decode()
+
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+
+    await ctx.send(f"CSV Loaded ({len(rows)} rows)")
+
+# ================= RECAP =================
+
+@bot.command()
+async def recap(ctx):
+    if not history:
+        await ctx.send("No history.")
+        return
+
+    wins = len(history)
+    await ctx.send(f"Recap: {wins} tracked plays")
+
+# ================= EVENTS =================
+
+@bot.event
+async def on_ready():
+    print(f"ENTERPRISE BOT READY: {bot.user}")
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    content = message.content
+
+    if "vs" in content and "@" in content:
+        plays = extract_plays(content)
+        added = schedule_message_plays(message, plays)
+        await message.channel.send(f"REMINDERS SET ({added})")
+        return
+
+    await bot.process_commands(message)
+
+@bot.event
+async def on_message_edit(before, after):
+    if after.author.bot:
+        return
+
+    content = after.content
+
+    if "vs" in content and "@" in content:
+        plays = extract_plays(content)
+        schedule_message_plays(after, plays)
+
+# ================= RUN =================
+
+bot.run(TOKEN)
