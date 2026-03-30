@@ -138,10 +138,12 @@ def parse_play_line_for_reminder(line):
     else:              tier = "normal"
 
     # EST time — grab the time immediately after "@" and before "EST"
-    time_match = re.search(r'@\s*(\d{1,2}:\d{2}\s*[AP]M)\s*EST', line, re.IGNORECASE)
+    # Handles formats: "12:05 PM EST", "12:05pm est", "12:05PM EST"
+    time_match = re.search(r'@\s*(\d{1,2}:\d{2})\s*([AaPp][Mm])\s*[Ee][Ss][Tt]', line)
     if not time_match:
         return None
-    time_str = time_match.group(1).strip()
+    # Normalise: always "HH:MM AM" with a space before AM/PM
+    time_str = time_match.group(1).strip() + " " + time_match.group(2).strip().upper()
 
     # Record (wins/total)
     record_match = re.search(r'\((\d+)/(\d+)\)', line)
@@ -163,15 +165,18 @@ def parse_play_line_for_reminder(line):
     now_est = datetime.now(EST)
     try:
         naive_game = datetime.strptime(
-            f"{now_est.month}/{now_est.day} {time_str}", "%m/%d %I:%M %p"
+            f"{now_est.year}/{now_est.month}/{now_est.day} {time_str}", "%Y/%m/%d %I:%M %p"
         )
     except ValueError:
         return None
 
     game_dt = naive_game.replace(tzinfo=EST)
 
-    # If the time already passed today, assume it's tomorrow
-    if game_dt < now_est - timedelta(minutes=6):
+    # If the time is more than 2 hours in the past, assume it belongs to tomorrow.
+    # We use 2 hours instead of minutes to handle slates posted after midnight
+    # where early-AM games (e.g. 12:00 AM, 1:00 AM) may have just passed but
+    # later games in the same slate (e.g. 9:30 PM) are still today.
+    if game_dt < now_est - timedelta(hours=2):
         game_dt += timedelta(days=1)
 
     return {
@@ -263,15 +268,96 @@ def extract_play_keys_from_text(text):
 async def schedule_reminders_from_text(text):
     """
     Parse every line of a text block and schedule reminders for valid plays.
+    Treats the entire block as one slate day: the earliest parseable time
+    anchors the calendar date, and all other times are assigned to the same
+    date (rolling to the next day only if they are before the anchor).
     Returns a list of result dicts (one per successfully scheduled play).
     """
-    results = []
+    now_est = datetime.now(EST)
+
+    # ── Pass 1: collect all (line, time_str) pairs ──
+    raw_plays = []
     for raw_line in text.split("\n"):
-        play = parse_play_line_for_reminder(raw_line)
-        if play:
-            result = schedule_reminders_for_play(play)
-            if result["scheduled"]:
-                results.append(result)
+        line = re.sub(r'\s+', ' ', raw_line).strip()
+        if "vs" not in line or "@" not in line:
+            continue
+        if not re.search(r'est', line, re.IGNORECASE):
+            continue
+        tm = re.search(r'@\s*(\d{1,2}:\d{2})\s*([AaPp][Mm])\s*[Ee][Ss][Tt]', line)
+        if not tm:
+            continue
+        record_match = re.search(r'\((\d+)/(\d+)\)', line)
+        if not record_match:
+            continue
+        time_str = tm.group(1).strip() + " " + tm.group(2).strip().upper()
+        raw_plays.append((line, time_str))
+
+    if not raw_plays:
+        return []
+
+    # ── Pass 2: determine the anchor date ──
+    # Build all candidate datetimes for today and pick the one closest to now
+    # that is still in the future (or least in the past within 2 hours).
+    # This anchors the whole slate to the correct calendar date.
+    def to_minutes(ts):
+        try:
+            dt = datetime.strptime(ts, "%I:%M %p")
+            return dt.hour * 60 + dt.minute
+        except:
+            return None
+
+    # Find the earliest time in the slate (by minutes since midnight)
+    # That anchors us to the slate's "start of day"
+    all_mins = [to_minutes(ts) for _, ts in raw_plays]
+    all_mins = [m for m in all_mins if m is not None]
+    slate_start_mins = min(all_mins) if all_mins else 0  # e.g. 0 = midnight
+
+    # Determine what date the slate start belongs to.
+    # If slate starts at midnight (0-120 mins) and current time is past that
+    # by up to 23 hours, it's still today's slate.
+    slate_start_today = now_est.replace(
+        hour=slate_start_mins // 60,
+        minute=slate_start_mins % 60,
+        second=0, microsecond=0
+    )
+    # If the slate start was more than 23 hours ago, anchor to tomorrow
+    if slate_start_today < now_est - timedelta(hours=23):
+        anchor_date = (now_est + timedelta(days=1)).date()
+    else:
+        anchor_date = now_est.date() if slate_start_today <= now_est else now_est.date()
+
+    # ── Pass 3: assign each play to the correct datetime ──
+    results = []
+    for line, time_str in raw_plays:
+        try:
+            naive = datetime.strptime(
+                f"{anchor_date.year}/{anchor_date.month}/{anchor_date.day} {time_str}",
+                "%Y/%m/%d %I:%M %p"
+            )
+        except ValueError:
+            continue
+
+        game_dt = naive.replace(tzinfo=EST)
+
+        # If this time is before the slate start on anchor_date, it belongs
+        # to the next calendar day (e.g. a 12:30 AM game after a 9 PM game)
+        slate_start_dt = datetime(
+            anchor_date.year, anchor_date.month, anchor_date.day,
+            slate_start_mins // 60, slate_start_mins % 60, tzinfo=EST
+        )
+        if game_dt < slate_start_dt:
+            game_dt += timedelta(days=1)
+
+        # Re-parse the full play with the corrected game_dt
+        play = parse_play_line_for_reminder(line)
+        if not play:
+            continue
+        play["game_dt"] = game_dt  # override with batch-corrected datetime
+
+        result = schedule_reminders_for_play(play)
+        if result["scheduled"]:
+            results.append(result)
+
     return results
 
 
@@ -532,7 +618,7 @@ async def on_message_edit(before, after):
     - Find play lines that were ADDED to the message
     - Schedule reminders for them
     """
-    if after.channel.id not in (FOUR_PLUS_CHANNEL, TOTALS_CHANNEL):
+    if after.channel.id not in (FOUR_PLUS_CHANNEL, TOTALS_CHANNEL, TEST_CHANNEL):
         return
 
     keys_before = extract_play_keys_from_text(before.content)
@@ -561,7 +647,7 @@ async def on_message_delete(message):
     When a message in 4+/totals is deleted:
     - Cancel all reminder tasks for every play in that message.
     """
-    if message.channel.id not in (FOUR_PLUS_CHANNEL, TOTALS_CHANNEL):
+    if message.channel.id not in (FOUR_PLUS_CHANNEL, TOTALS_CHANNEL, TEST_CHANNEL):
         return
 
     keys = extract_play_keys_from_text(message.content)
@@ -578,16 +664,18 @@ async def on_message(message):
 
     global last_slate_messages
 
+    # ── Bot or human posts in 4+, totals, or test channel — schedule reminders ──
+    # This runs BEFORE the bot check so bot-posted slates also get picked up
+    if message.channel.id in (FOUR_PLUS_CHANNEL, TOTALS_CHANNEL, TEST_CHANNEL):
+        results = await schedule_reminders_from_text(message.content)
+        if results:
+            conf_ch = message.channel if message.channel.id == TEST_CHANNEL else None
+            await send_reminder_confirmation(results, override_channel=conf_ch)
+
     if message.author.bot:
         return
 
     content=message.content.lower().strip()
-
-    # ── When a human posts directly into 4+ or totals, schedule reminders ──
-    if message.channel.id in (FOUR_PLUS_CHANNEL, TOTALS_CHANNEL):
-        results = await schedule_reminders_from_text(message.content)
-        if results:
-            await send_reminder_confirmation(results)
 
 # ==============================
 # RECAP COMMANDS
