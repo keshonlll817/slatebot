@@ -5,12 +5,12 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import os
 
-# ================== CONFIG ==================
-TOKEN = os.getenv("TOKEN")  # or replace with string
+# ================= CONFIG =================
+TOKEN = os.getenv("TOKEN")
 ROLE_NAME = "TT Official"
 EST = ZoneInfo("America/New_York")
 
-# ================== BOT SETUP ==================
+# ================= BOT =================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -18,23 +18,21 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ================== STORAGE ==================
-scheduled_tasks = {}  # {guild_id: {key: task}}
+# {guild_id: {message_id: {key: task}}}
+scheduled_tasks = {}
 
-# ================== HELPERS ==================
+# ================= HELPERS =================
 
-def make_key(league, p1, p2, time_str):
-    return f"{league}|{p1}|{p2}|{time_str}"
+def make_key(l, p1, p2, t):
+    return f"{l}|{p1}|{p2}|{t}"
 
 def parse_time(time_str):
     now = datetime.now(EST)
-
     dt = datetime.strptime(
         f"{now.strftime('%Y-%m-%d')} {time_str}",
         "%Y-%m-%d %I:%M %p"
     ).replace(tzinfo=EST)
 
-    # Prevent false "next day"
     if dt < now - timedelta(minutes=2):
         dt += timedelta(days=1)
 
@@ -43,20 +41,18 @@ def parse_time(time_str):
 def find_role(guild):
     return discord.utils.get(guild.roles, name=ROLE_NAME)
 
-async def send_ping(channel, text):
-    role = find_role(channel.guild)
-
+async def send_ping(ch, text):
+    role = find_role(ch.guild)
     if role:
-        await channel.send(
+        await ch.send(
             f"{role.mention} {text}",
             allowed_mentions=discord.AllowedMentions(roles=True)
         )
     else:
-        await channel.send(text)
+        await ch.send(text)
 
 def extract_plays(text):
     plays = []
-
     for line in text.splitlines():
         if "@" in line and "vs" in line:
             try:
@@ -75,40 +71,41 @@ def extract_plays(text):
                 })
             except:
                 continue
-
     return plays
 
-# ================== REMINDERS ==================
+# ================= CORE =================
 
-def schedule_play(play, channel, guild_id):
-    key = make_key(play["league"], play["p1"], play["p2"], play["time"])
+def schedule_message_plays(message, plays):
+    guild_id = message.guild.id
+    message_id = message.id
 
     if guild_id not in scheduled_tasks:
         scheduled_tasks[guild_id] = {}
 
-    if key in scheduled_tasks[guild_id]:
-        return
+    # clear ONLY this message
+    if message_id in scheduled_tasks[guild_id]:
+        for t in scheduled_tasks[guild_id][message_id].values():
+            t.cancel()
 
-    dt = parse_time(play["time"])
-    delay = (dt - datetime.now(EST)).total_seconds()
+    scheduled_tasks[guild_id][message_id] = {}
 
-    async def reminder():
-        await asyncio.sleep(delay)
-        await send_ping(
-            channel,
-            f"{play['league']} – {play['p1']} vs {play['p2']} | STARTING SOON"
-        )
+    for play in plays:
+        key = make_key(play["league"], play["p1"], play["p2"], play["time"])
 
-    task = asyncio.create_task(reminder())
-    scheduled_tasks[guild_id][key] = task
+        dt = parse_time(play["time"])
+        delay = (dt - datetime.now(EST)).total_seconds()
 
-def clear_guild_tasks(guild_id):
-    if guild_id in scheduled_tasks:
-        for task in scheduled_tasks[guild_id].values():
-            task.cancel()
-        scheduled_tasks[guild_id].clear()
+        async def reminder(p=play):
+            await asyncio.sleep(delay)
+            await send_ping(
+                message.channel,
+                f"{p['league']} – {p['p1']} vs {p['p2']} | STARTING SOON"
+            )
 
-# ================== EVENTS ==================
+        task = asyncio.create_task(reminder())
+        scheduled_tasks[guild_id][message_id][key] = task
+
+# ================= EVENTS =================
 
 @bot.event
 async def on_ready():
@@ -120,68 +117,65 @@ async def on_message(message):
         return
 
     content = message.content
-    guild_id = message.guild.id
 
     if "vs" in content and "@" in content:
         plays = extract_plays(content)
-
-        clear_guild_tasks(guild_id)
-
-        for play in plays:
-            schedule_play(play, message.channel, guild_id)
+        schedule_message_plays(message, plays)
 
         await message.channel.send(f"⏰ REMINDERS SET ({len(plays)} plays)")
         return
 
     if content == "!reminders":
-        if guild_id not in scheduled_tasks or not scheduled_tasks[guild_id]:
+        guild_id = message.guild.id
+
+        if guild_id not in scheduled_tasks:
             await message.channel.send("⏰ No reminders currently scheduled.")
             return
 
         now = datetime.now(EST)
+        total = sum(len(m) for m in scheduled_tasks[guild_id].values())
 
-        lines = [f"⏰ ACTIVE REMINDERS ({len(scheduled_tasks[guild_id])})"]
+        if total == 0:
+            await message.channel.send("⏰ No reminders currently scheduled.")
+            return
 
-        for key in scheduled_tasks[guild_id]:
-            try:
-                league, p1, p2, time_str = key.split("|")
-                dt = parse_time(time_str)
+        lines = [f"⏰ ACTIVE REMINDERS ({total})"]
 
-                delta = dt - now
-                h = int(delta.total_seconds() // 3600)
-                m = int((delta.total_seconds() % 3600) // 60)
+        for msg_tasks in scheduled_tasks[guild_id].values():
+            for key in msg_tasks:
+                try:
+                    league, p1, p2, time_str = key.split("|")
+                    dt = parse_time(time_str)
 
-                lines.append(
-                    f"{league} – {p1} vs {p2} @ {time_str} → in {h}h {m}m"
-                )
-            except:
-                continue
+                    delta = dt - now
+                    h = int(delta.total_seconds() // 3600)
+                    m = int((delta.total_seconds() % 3600) // 60)
+
+                    lines.append(
+                        f"{league} – {p1} vs {p2} @ {time_str} → in {h}h {m}m"
+                    )
+                except:
+                    continue
 
         await message.channel.send("\n".join(lines))
         return
 
     await bot.process_commands(message)
 
-# ✅ EDIT HANDLER (NEW FIX)
 @bot.event
 async def on_message_edit(before, after):
     if after.author.bot:
         return
 
     content = after.content
-    guild_id = after.guild.id
 
     if "vs" in content and "@" in content:
         plays = extract_plays(content)
-
-        clear_guild_tasks(guild_id)
-
-        for play in plays:
-            schedule_play(play, after.channel, guild_id)
+        schedule_message_plays(after, plays)
 
         await after.channel.send(f"🔄 REMINDERS UPDATED ({len(plays)} plays)")
 
-# ================== RUN ==================
+# ================= RUN =================
 
 if not TOKEN:
     print("❌ TOKEN missing")
