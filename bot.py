@@ -317,8 +317,8 @@ async def on_message(message):
         elif "weekly" in content:
             days_since_monday=now.weekday()
             start=now.replace(hour=0,minute=0,second=0,microsecond=0)-timedelta(days=days_since_monday)
-            end=now
-            title=f"WEEKLY RECAP — {start.strftime('%b %-d')} → {now.strftime('%b %-d')} (EST)"
+            end=start+timedelta(days=7)
+            title=f"WEEKLY RECAP — {start.strftime('%b %-d')} → {end.strftime('%b %-d')} (EST)"
             limit=None
 
         elif "monthly" in content:
