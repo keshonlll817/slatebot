@@ -275,16 +275,17 @@ async def schedule_reminders_from_text(text):
     return results
 
 
-async def send_reminder_confirmation(results):
+async def send_reminder_confirmation(results, override_channel=None):
     """
-    Post a confirmation message to CONFIRMATION_CHANNEL listing every play
-    that had reminders scheduled — matchup + tier emoji only, no fire times.
+    Post a confirmation message listing every play that had reminders scheduled.
+    Sends to CONFIRMATION_CHANNEL by default, or override_channel if provided
+    (used when posting from the test channel).
     """
-    ch = client.get_channel(CONFIRMATION_CHANNEL)
-    if not ch:
+    if not results:
         return
 
-    if not results:
+    ch = override_channel if override_channel else client.get_channel(CONFIRMATION_CHANNEL)
+    if not ch:
         return
 
     tier_tag = {"nuke": " ☢️", "caution": " ⚠️", "normal": ""}
@@ -973,7 +974,8 @@ async def on_message(message):
         # Confirmation: show which reminders were scheduled for 4+ plays
         results_4plus = await schedule_reminders_from_text(text)
         if results_4plus:
-            await send_reminder_confirmation(results_4plus)
+            conf_ch = message.channel if message.channel.id == TEST_CHANNEL else None
+            await send_reminder_confirmation(results_4plus, override_channel=conf_ch)
 
     msg3=await message.channel.send("🏓 **TOTAL PLAYS** 🏓")
     last_slate_messages.append(msg3)
@@ -994,6 +996,7 @@ async def on_message(message):
         # Confirmation: show which reminders were scheduled for totals plays
         results_totals = await schedule_reminders_from_text(text)
         if results_totals:
-            await send_reminder_confirmation(results_totals)
+            conf_ch = message.channel if message.channel.id == TEST_CHANNEL else None
+            await send_reminder_confirmation(results_totals, override_channel=conf_ch)
 
 client.run(TOKEN)
