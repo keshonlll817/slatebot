@@ -314,6 +314,14 @@ async def on_message(message):
             title=f"DAILY RECAP — {start.strftime('%b')} {start.day} (EST)"
             limit=None
 
+        elif "last week" in content or "lastweek" in content.replace(" ",""):
+            days_since_monday=now.weekday()
+            this_monday=now.replace(hour=0,minute=0,second=0,microsecond=0)-timedelta(days=days_since_monday)
+            start=this_monday-timedelta(days=7)
+            end=this_monday
+            title=f"LAST WEEK RECAP — {start.strftime('%b %-d')} → {end.strftime('%b %-d')} (EST)"
+            limit=None
+
         elif "weekly" in content:
             days_since_monday=now.weekday()
             start=now.replace(hour=0,minute=0,second=0,microsecond=0)-timedelta(days=days_since_monday)
@@ -476,6 +484,41 @@ async def on_message(message):
 
     if content=="ping":
         await message.channel.send("pong")
+        return
+
+    if content=="!help" or content=="!commands":
+        help_msg=(
+            "🏓 **SLATEBOT COMMANDS** 🏓\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "\n"
+            "📂 **SLATE**\n"
+            "Upload a `.csv` file in an allowed channel to post the day's slate.\n"
+            "The bot will delete the previous slate and post a fresh one automatically.\n"
+            "\n"
+            "📊 **RECAP COMMANDS**\n"
+            "`!recap today` — Recap from midnight to now\n"
+            "`!recap yesterday` — Full recap for yesterday\n"
+            "`!recap weekly` — This week Mon → Mon\n"
+            "`!recap last week` — Last full week Mon → Mon\n"
+            "`!recap monthly` — This month so far\n"
+            "`!recap lifetime` — All-time recap\n"
+            "`!recap test` — Test recap (last 50 msgs)\n"
+            "\n"
+            "🔍 **VERIFY**\n"
+            "`!recap verify` — Full audit of last 50 plays in the 4+ channel.\n"
+            "Shows counted plays, ignored lines, duplicates, and verified result.\n"
+            "\n"
+            "🎮 **OTHER**\n"
+            "`ping` — Check if bot is online (responds with `pong`)\n"
+            "`!help` or `!commands` — Show this menu\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "💡 **PLAY TIERS (4+ Channel)**\n"
+            "Normal — Standard play\n"
+            "⚠️ Caution — Lower confidence play\n"
+            "☢️ Nuke — Highest confidence play\n"
+            "🧼 Wash — No result counted"
+        )
+        await message.channel.send(help_msg)
         return
 
 
