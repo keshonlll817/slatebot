@@ -3,6 +3,7 @@ import csv
 import io
 import re
 import os
+import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -17,9 +18,11 @@ ALLOWED_CHANNELS = [
 1479241150996152340
 ]
 
-FOUR_PLUS_CHANNEL = 1443356395935240302
-TOTALS_CHANNEL = 1446203029916356649
-TEST_CHANNEL = 1471792196582637728
+FOUR_PLUS_CHANNEL  = 1443356395935240302
+TOTALS_CHANNEL     = 1446203029916356649
+TEST_CHANNEL       = 1471792196582637728
+REMINDER_CHANNEL   = 1442010467345236160   # #tabletennis-chat
+CONFIRMATION_CHANNEL = 1452410545016930335  # reminders confirmation channel
 
 EST = ZoneInfo("America/New_York")
 
@@ -30,56 +33,283 @@ client = discord.Client(intents=intents)
 last_slate_messages = []
 
 # ==============================
+# REMINDER STATE
+# ==============================
+# Maps a unique play key -> list of asyncio.Task objects (SOON + NOW)
+# Key format: "{league}|{p1}|{p2}|{game_iso}"
+scheduled_tasks = {}
+
+
+# ==============================
 # UTIL FUNCTIONS
 # ==============================
 
 def format_units(u):
-    if u == 1: return "1U"
+    if u == 1:    return "1U"
     if u == 1.25: return "1.25U"
-    if u == 1.5: return "1.5U"
+    if u == 1.5:  return "1.5U"
     if u == 1.75: return "1.75U"
-    if u == 2: return "2U"
-    if u == 2.5: return "2.5U"
-    if u == 3: return "3U"
+    if u == 2:    return "2U"
+    if u == 2.5:  return "2.5U"
+    if u == 3:    return "3U"
     return f"{u}U"
 
 def convert_league(name):
-    name=name.lower()
+    name = name.lower()
     if "elite" in name: return "ELITE"
     if "setka" in name: return "SETKA"
     if "czech" in name: return "CZECH"
-    if "cup" in name: return "CUP"
+    if "cup"   in name: return "CUP"
     return name.upper()
 
 def parse_time(est_time):
-    dt=datetime.strptime(est_time,"%m/%d %I:%M %p")
-    est=dt.strftime("%I:%M %p")
-    pst_dt=dt.replace(hour=(dt.hour-3)%24)
-    pst=pst_dt.strftime("%I:%M %p")
-    return est,pst
+    dt     = datetime.strptime(est_time, "%m/%d %I:%M %p")
+    est    = dt.strftime("%I:%M %p")
+    pst_dt = dt.replace(hour=(dt.hour - 3) % 24)
+    pst    = pst_dt.strftime("%I:%M %p")
+    return est, pst
 
-async def send_long_message(channel,text):
-
-    chunks=[]
-
-    while len(text)>2000:
-        split_index=text.rfind("\n",0,2000)
-
-        if split_index==-1:
-            split_index=2000
-
+async def send_long_message(channel, text):
+    chunks = []
+    while len(text) > 2000:
+        split_index = text.rfind("\n", 0, 2000)
+        if split_index == -1:
+            split_index = 2000
         chunks.append(text[:split_index])
-        text=text[split_index:]
-
+        text = text[split_index:]
     chunks.append(text)
-
-    messages=[]
-
+    messages = []
     for chunk in chunks:
-        msg=await channel.send(chunk.strip())
+        msg = await channel.send(chunk.strip())
         messages.append(msg)
-
     return messages
+
+
+# ==============================
+# REMINDER ENGINE
+# ==============================
+
+def make_play_key(league, p1, p2, game_dt):
+    """Unique key for a play used to track and cancel its reminder tasks."""
+    return f"{league}|{p1}|{p2}|{game_dt.isoformat()}"
+
+
+def build_reminder_text(league, p1, p2, wins, total, tier, label):
+    """
+    Build the reminder message matching the format:
+    LEAGUE – P1 vs P2 EMOJI (wins/total) | LABEL
+    """
+    if   tier == "nuke":    emoji = " ☢️"
+    elif tier == "caution": emoji = " ⚠️"
+    else:                   emoji = ""
+    return f"@TT Official\n{league} – {p1} vs {p2}{emoji} ({wins}/{total}) | {label}"
+
+
+def parse_play_line_for_reminder(line):
+    """
+    Parse a slate line from the 4+ or totals channel into reminder components.
+
+    Expected 4+ format:
+        LEAGUE – P1 vs P2 @ HH:MM AM/PM EST / HH:MM AM/PM PST (wins/total) [emoji]
+
+    Expected totals format:
+        LEAGUE – P1 vs P2 PLAY XU @ HH:MM AM/PM EST / HH:MM AM/PM PST (wins/total)
+
+    Returns a dict with keys: league, p1, p2, wins, total, tier, game_dt
+    Returns None if line cannot be parsed into a valid play.
+    """
+    line = re.sub(r'\s+', ' ', line).strip()
+
+    # Must contain "vs" and "@ ... EST"
+    if "vs" not in line or "@" not in line or "EST" not in line:
+        return None
+
+    # League
+    ll = line.lower()
+    if   "elite" in ll: league = "ELITE"
+    elif "setka" in ll: league = "SETKA"
+    elif "czech" in ll: league = "CZECH"
+    elif "cup"   in ll: league = "CUP"
+    else:               league = "OTHER"
+
+    # Tier
+    if   "☢️" in line: tier = "nuke"
+    elif "⚠️" in line: tier = "caution"
+    else:              tier = "normal"
+
+    # EST time — grab the time immediately after "@" and before "EST"
+    time_match = re.search(r'@\s*(\d{1,2}:\d{2}\s*[AP]M)\s*EST', line, re.IGNORECASE)
+    if not time_match:
+        return None
+    time_str = time_match.group(1).strip()
+
+    # Record (wins/total)
+    record_match = re.search(r'\((\d+)/(\d+)\)', line)
+    if not record_match:
+        return None
+    wins  = int(record_match.group(1))
+    total = int(record_match.group(2))
+
+    # Player names — strip league prefix, emojis, then grab "P1 vs P2"
+    body = re.sub(r'^[A-Z]+\s*[–\-]\s*', '', line).strip()
+    body = body.replace("☢️", "").replace("⚠️", "")
+    vs_match = re.search(r'^(.+?)\s+vs\s+(.+?)(?:\s+[\d\.]+U|\s+@|\s*\()', body, re.IGNORECASE)
+    if not vs_match:
+        return None
+    p1 = vs_match.group(1).strip()
+    p2 = vs_match.group(2).strip()
+
+    # Build timezone-aware datetime for the game in EST
+    now_est = datetime.now(EST)
+    try:
+        naive_game = datetime.strptime(
+            f"{now_est.month}/{now_est.day} {time_str}", "%m/%d %I:%M %p"
+        )
+    except ValueError:
+        return None
+
+    game_dt = naive_game.replace(tzinfo=EST)
+
+    # If the time already passed today, assume it's tomorrow
+    if game_dt < now_est - timedelta(minutes=6):
+        game_dt += timedelta(days=1)
+
+    return {
+        "league":  league,
+        "p1":      p1,
+        "p2":      p2,
+        "wins":    wins,
+        "total":   total,
+        "tier":    tier,
+        "game_dt": game_dt,
+    }
+
+
+async def _send_reminder_at(fire_dt, text):
+    """Sleep until fire_dt (EST-aware), then post to REMINDER_CHANNEL."""
+    now_est = datetime.now(EST)
+    delay   = (fire_dt - now_est).total_seconds()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    ch = client.get_channel(REMINDER_CHANNEL)
+    if ch:
+        await ch.send(text)
+
+
+def schedule_reminders_for_play(play):
+    """
+    Schedule STARTING SOON (-5 min) and STARTING NOW tasks for a play.
+    Skips if already scheduled or if fire time is in the past.
+    Returns a result dict describing what was scheduled (for confirmation messages).
+    """
+    league  = play["league"]
+    p1      = play["p1"]
+    p2      = play["p2"]
+    wins    = play["wins"]
+    total   = play["total"]
+    tier    = play["tier"]
+    game_dt = play["game_dt"]
+
+    key     = make_play_key(league, p1, p2, game_dt)
+    now_est = datetime.now(EST)
+
+    # Already scheduled — skip
+    if key in scheduled_tasks:
+        return {"key": key, "status": "already_scheduled", "scheduled": []}
+
+    soon_dt    = game_dt - timedelta(minutes=5)
+    tasks      = []
+    scheduled  = []  # list of (label, fire_dt) that were actually scheduled
+
+    for fire_dt, label in [(soon_dt, "STARTING SOON"), (game_dt, "STARTING NOW")]:
+        if fire_dt <= now_est:
+            continue  # already past, skip
+        text = build_reminder_text(league, p1, p2, wins, total, tier, label)
+        task = asyncio.ensure_future(_send_reminder_at(fire_dt, text))
+        tasks.append(task)
+        scheduled.append((label, fire_dt))
+
+    if tasks:
+        scheduled_tasks[key] = tasks
+        print(f"[REMINDERS] Scheduled {len(tasks)} task(s) for: {key}")
+
+    return {"key": key, "status": "scheduled", "play": play, "scheduled": scheduled}
+
+
+def cancel_reminders_for_key(key):
+    """Cancel any pending reminder tasks for the given play key."""
+    tasks = scheduled_tasks.pop(key, [])
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        print(f"[REMINDERS] Cancelled reminders for: {key}")
+
+
+def extract_play_keys_from_text(text):
+    """
+    Parse all lines in a text block and return the set of play keys
+    that would be (or were) scheduled.  Used to diff edits.
+    """
+    keys = set()
+    for raw_line in text.split("\n"):
+        play = parse_play_line_for_reminder(raw_line)
+        if play:
+            keys.add(make_play_key(
+                play["league"], play["p1"], play["p2"], play["game_dt"]
+            ))
+    return keys
+
+
+async def schedule_reminders_from_text(text):
+    """
+    Parse every line of a text block and schedule reminders for valid plays.
+    Returns a list of result dicts (one per successfully scheduled play).
+    """
+    results = []
+    for raw_line in text.split("\n"):
+        play = parse_play_line_for_reminder(raw_line)
+        if play:
+            result = schedule_reminders_for_play(play)
+            if result["scheduled"]:
+                results.append(result)
+    return results
+
+
+async def send_reminder_confirmation(results):
+    """
+    Post a confirmation message to CONFIRMATION_CHANNEL listing every play
+    that had reminders scheduled — matchup + tier emoji only, no fire times.
+    """
+    ch = client.get_channel(CONFIRMATION_CHANNEL)
+    if not ch:
+        return
+
+    if not results:
+        return
+
+    tier_tag = {"nuke": " ☢️", "caution": " ⚠️", "normal": ""}
+
+    lines = ["⏰ **REMINDERS SET** ━━━━━━━━━━━━━━━━━━"]
+    for r in results:
+        play = r["play"]
+        tag  = tier_tag.get(play["tier"], "")
+        lines.append(f"{play['league']} – {play['p1']} vs {play['p2']}{tag}")
+
+    lines.append(f"\n**{len(results)} play(s) queued.**")
+    await ch.send("\n".join(lines))
+
+
+async def reschedule_from_channel(channel, lookback_hours=20):
+    """
+    On startup: read recent messages from a channel (both bot and human posts)
+    and reschedule any reminders whose game time is still in the future.
+    """
+    cutoff  = datetime.now(EST) - timedelta(hours=lookback_hours)
+    async for msg in channel.history(limit=300):
+        msg_time = msg.created_at.astimezone(EST)
+        if msg_time < cutoff:
+            break
+        await schedule_reminders_from_text(msg.content)
 
 
 # ==============================
@@ -267,10 +497,80 @@ async def parse_totals(channel, start, end, limit=None):
     return wins,losses,units
 
 
+# ==============================
+# STARTUP
+# ==============================
+
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
 
+    # Reschedule any reminders still in the future from today's slate
+    four_ch   = client.get_channel(FOUR_PLUS_CHANNEL)
+    totals_ch = client.get_channel(TOTALS_CHANNEL)
+
+    if four_ch:
+        await reschedule_from_channel(four_ch)
+        print("[REMINDERS] Rescheduled from 4+ channel.")
+
+    if totals_ch:
+        await reschedule_from_channel(totals_ch)
+        print("[REMINDERS] Rescheduled from totals channel.")
+
+
+# ==============================
+# MESSAGE EDIT HANDLER
+# ==============================
+
+@client.event
+async def on_message_edit(before, after):
+    """
+    When a message in 4+/totals is edited:
+    - Find play lines that were REMOVED from the message
+    - Cancel their reminders
+    - Find play lines that were ADDED to the message
+    - Schedule reminders for them
+    """
+    if after.channel.id not in (FOUR_PLUS_CHANNEL, TOTALS_CHANNEL):
+        return
+
+    keys_before = extract_play_keys_from_text(before.content)
+    keys_after  = extract_play_keys_from_text(after.content)
+
+    # Cancel reminders for removed plays
+    for key in keys_before - keys_after:
+        cancel_reminders_for_key(key)
+
+    # Schedule reminders for newly added plays
+    for raw_line in after.content.split("\n"):
+        play = parse_play_line_for_reminder(raw_line)
+        if play:
+            key = make_play_key(play["league"], play["p1"], play["p2"], play["game_dt"])
+            if key not in keys_before:
+                schedule_reminders_for_play(play)
+
+
+# ==============================
+# MESSAGE DELETE HANDLER
+# ==============================
+
+@client.event
+async def on_message_delete(message):
+    """
+    When a message in 4+/totals is deleted:
+    - Cancel all reminder tasks for every play in that message.
+    """
+    if message.channel.id not in (FOUR_PLUS_CHANNEL, TOTALS_CHANNEL):
+        return
+
+    keys = extract_play_keys_from_text(message.content)
+    for key in keys:
+        cancel_reminders_for_key(key)
+
+
+# ==============================
+# MESSAGE HANDLER
+# ==============================
 
 @client.event
 async def on_message(message):
@@ -281,6 +581,12 @@ async def on_message(message):
         return
 
     content=message.content.lower().strip()
+
+    # ── When a human posts directly into 4+ or totals, schedule reminders ──
+    if message.channel.id in (FOUR_PLUS_CHANNEL, TOTALS_CHANNEL):
+        results = await schedule_reminders_from_text(message.content)
+        if results:
+            await send_reminder_confirmation(results)
 
 # ==============================
 # RECAP COMMANDS
@@ -486,6 +792,28 @@ async def on_message(message):
         await message.channel.send("pong")
         return
 
+    if content=="!reminders":
+        if not scheduled_tasks:
+            await message.channel.send("⏰ No reminders currently scheduled.")
+            return
+
+        lines = [f"⏰ **ACTIVE REMINDERS** ({len(scheduled_tasks)} play(s)) ━━━━━━━━━━━━━━━━━━"]
+
+        for key in sorted(scheduled_tasks.keys()):
+            # key format: "LEAGUE|P1|P2|game_dt_iso"
+            parts = key.split("|")
+            if len(parts) < 4:
+                continue
+            league_k, p1_k, p2_k, game_iso = parts[0], parts[1], parts[2], parts[3]
+            try:
+                game_dt_k = datetime.fromisoformat(game_iso)
+            except ValueError:
+                continue
+            lines.append(f"{league_k} – {p1_k} vs {p2_k} @ {game_dt_k.strftime('%I:%M %p')} EST")
+
+        await send_long_message(message.channel, "\n".join(lines))
+        return
+
     if content=="!help" or content=="!commands":
         help_msg=(
             "🏓 **SLATEBOT COMMANDS** 🏓\n"
@@ -510,6 +838,7 @@ async def on_message(message):
             "\n"
             "🎮 **OTHER**\n"
             "`ping` — Check if bot is online (responds with `pong`)\n"
+            "`!reminders` — Show all currently active/pending reminders\n"
             "`!help` or `!commands` — Show this menu\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "💡 **PLAY TIERS (4+ Channel)**\n"
@@ -641,6 +970,11 @@ async def on_message(message):
         sent_msgs=await send_long_message(message.channel,text.strip())
         last_slate_messages.extend(sent_msgs)
 
+        # Confirmation: show which reminders were scheduled for 4+ plays
+        results_4plus = await schedule_reminders_from_text(text)
+        if results_4plus:
+            await send_reminder_confirmation(results_4plus)
+
     msg3=await message.channel.send("🏓 **TOTAL PLAYS** 🏓")
     last_slate_messages.append(msg3)
 
@@ -656,5 +990,10 @@ async def on_message(message):
 
         sent_msgs=await send_long_message(message.channel,text.strip())
         last_slate_messages.extend(sent_msgs)
+
+        # Confirmation: show which reminders were scheduled for totals plays
+        results_totals = await schedule_reminders_from_text(text)
+        if results_totals:
+            await send_reminder_confirmation(results_totals)
 
 client.run(TOKEN)
