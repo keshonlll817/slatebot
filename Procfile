@@ -1,1 +1,1 @@
-worker: python Slatebot.py
+worker: python SlateBot.py
